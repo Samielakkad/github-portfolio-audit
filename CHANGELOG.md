@@ -6,8 +6,9 @@ All notable changes are documented here. The project follows semantic versioning
 
 - Isolate Action reports in a private runner temporary directory and remove them
   on exit instead of trusting a caller-workspace path.
-- Validate Git tree object types, non-empty file sizes, workflow extensions, and
-  test-directory contents before awarding repository evidence.
+- Validate Git tree object types and sizes, parse workflow content for continuous
+  integration triggers and executable jobs, and recognize cross-ecosystem test
+  source conventions before awarding repository evidence.
 - Distinguish inapplicable checks from unknown evidence and report weighted
   evidence coverage; zero audited repositories now produce a zero overall score.
 - Handle empty Git repositories without aborting a portfolio audit.
@@ -15,8 +16,9 @@ All notable changes are documented here. The project follows semantic versioning
   applicable defaults from an account's public `.github` repository.
 - Reject explicitly selected ineligible repositories and deduplicate repeated
   repository names case-insensitively.
-- Retry transient read-only API requests with bounded exponential backoff and
-  `Retry-After` support.
+- Retry transient read-only API requests with bounded exponential backoff, honor
+  GitHub rate-limit delays without shortening them, and fail promptly when the
+  required wait exceeds five minutes.
 
 ## 0.1.0 - 2026-07-13
 

@@ -57,6 +57,42 @@ def test_markdown_renderer_escapes_tables_and_rejects_vanity_scoring():
     assert "500" in value
 
 
+def test_markdown_renderer_neutralizes_untrusted_markup():
+    report = sample_report()
+    report.profile_checks[0] = CheckResult(
+        "bio",
+        "Profile | bio",
+        "fail",
+        20,
+        "![spoof](https://evil.test/image) <img src=x> "
+        "[click](javascript:alert(1)) ~~hidden~~",
+        "Add bio.",
+    )
+
+    value = render_markdown(report)
+
+    assert "\\!\\[spoof\\]\\(https://evil.test/image\\)" in value
+    assert "&lt;img src=x&gt;" in value
+    assert "[click](javascript" not in value
+    assert "\\~\\~hidden\\~\\~" in value
+
+
+def test_markdown_renderer_preserves_html_entities():
+    report = sample_report()
+    report.profile_checks[0] = CheckResult(
+        "bio",
+        "Profile bio",
+        "pass",
+        20,
+        "O'Brien & team",
+    )
+
+    value = render_markdown(report)
+
+    assert "O&#x27;Brien &amp; team" in value
+    assert "\\#x27" not in value
+
+
 def test_markdown_renderer_surfaces_unknown_applicable_evidence():
     report = sample_report()
     report.repositories[0].checks = [
@@ -66,4 +102,36 @@ def test_markdown_renderer_surfaces_unknown_applicable_evidence():
     value = render_markdown(report)
 
     assert "Evidence was unavailable" in value
+    assert "No scored gaps found" not in value
+
+
+def test_markdown_renderer_uses_specific_unknown_remediation():
+    report = sample_report()
+    report.repositories[0].checks = [
+        CheckResult(
+            "ci",
+            "CI",
+            "skip",
+            100,
+            "too many candidates",
+            "Remove obsolete workflows.",
+        )
+    ]
+
+    value = render_markdown(report)
+
+    assert "Remove obsolete workflows" in value
+    assert "retry with a complete repository tree" not in value
+
+
+def test_markdown_renderer_explains_zero_repository_score():
+    report = sample_report()
+    report.profile_checks = [
+        CheckResult("bio", "Profile bio", "pass", 100, "Complete")
+    ]
+    report.repositories = []
+
+    value = render_markdown(report)
+
+    assert "No eligible repositories were audited" in value
     assert "No scored gaps found" not in value

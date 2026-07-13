@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 from portfolio_audit.audit import PROFILE_WEIGHTS, REPOSITORY_WEIGHTS, audit_portfolio
@@ -59,6 +61,13 @@ def repository(name="quality-tool", **overrides):
     return value
 
 
+def git_blob(content):
+    return {
+        "encoding": "base64",
+        "content": base64.b64encode(content.encode()).decode(),
+    }
+
+
 def complete_responses(repo_name="quality-tool"):
     return {
         "users/Example": user(),
@@ -79,12 +88,17 @@ def complete_responses(repo_name="quality-tool"):
                     "path": ".github/workflows/ci.yml",
                     "type": "blob",
                     "size": 100,
+                    "sha": "ci-workflow",
                 },
                 {"path": "tests/test_tool.py", "type": "blob", "size": 100},
                 {"path": "CONTRIBUTING.md", "type": "blob", "size": 100},
                 {"path": "SECURITY.md", "type": "blob", "size": 100},
             ],
         },
+        f"repos/Example/{repo_name}/git/blobs/ci-workflow": git_blob(
+            "on: [push, pull_request]\n"
+            "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        ),
     }
 
 
@@ -176,12 +190,12 @@ def test_truncated_tree_skips_unknown_paths_instead_of_false_failure():
     report = audit_portfolio(FakeClient(responses, [repo]), "Example")
 
     checks = {check.key: check for check in report.repositories[0].checks}
-    assert checks["readme"].status == "pass"
+    assert checks["readme"].status == "skip"
     assert checks["ci"].status == "skip"
     assert checks["security"].status == "skip"
     assert checks["ci"].applicable
-    assert report.repositories[0].score == 60
-    assert report.repositories[0].coverage == 60
+    assert report.repositories[0].score == 40
+    assert report.repositories[0].coverage == 40
 
 
 def test_default_branch_is_url_encoded_for_tree_lookup():
@@ -309,6 +323,7 @@ def test_supported_readme_locations_and_account_community_defaults_count():
                 "path": ".github/workflows/ci.yaml",
                 "type": "blob",
                 "size": 100,
+                "sha": "locations-workflow",
             },
             {"path": "tests/test_tool.py", "type": "blob", "size": 100},
         ],
@@ -334,6 +349,10 @@ def test_supported_readme_locations_and_account_community_defaults_count():
             },
         ],
     }
+    responses["repos/Example/locations/git/blobs/locations-workflow"] = git_blob(
+        "on: pull_request\n"
+        "jobs:\n  reuse:\n    uses: org/repo/.github/workflows/ci.yml@main\n"
+    )
 
     result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
     checks = {check.key: check for check in result.checks}
@@ -342,6 +361,139 @@ def test_supported_readme_locations_and_account_community_defaults_count():
     assert checks["readme"].evidence == "docs/README.rst"
     assert checks["contributing"].evidence.startswith("account .github default")
     assert checks["security"].evidence.startswith("account .github default")
+
+
+def test_higher_priority_empty_community_file_blocks_root_fallback():
+    repo = repository("precedence")
+    responses = complete_responses("precedence")
+    tree = responses["repos/Example/precedence/git/trees/main"]["tree"]
+    tree.extend(
+        [
+            {
+                "path": ".github/CONTRIBUTING.md",
+                "type": "blob",
+                "size": 0,
+            },
+            {"path": ".github/SECURITY.md", "type": "tree"},
+        ]
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    checks = {check.key: check for check in result.checks}
+
+    assert checks["contributing"].status == "fail"
+    assert checks["contributing"].evidence.startswith(".github/CONTRIBUTING.md")
+    assert checks["security"].status == "fail"
+    assert checks["security"].evidence.startswith(".github/SECURITY.md")
+
+
+def test_invalid_workflow_and_readme_only_test_directory_do_not_score():
+    repo = repository("false-positive")
+    responses = complete_responses("false-positive")
+    responses["repos/Example/false-positive/git/trees/main"] = {
+        "truncated": False,
+        "tree": [
+            {"path": "README.md", "type": "blob", "size": 100},
+            {
+                "path": ".github/workflows/noop.yml",
+                "type": "blob",
+                "size": 39,
+                "sha": "invalid-workflow",
+            },
+            {"path": "tests/README.md", "type": "blob", "size": 100},
+            {"path": "src/contest.py", "type": "blob", "size": 100},
+        ],
+    }
+    responses[
+        "repos/Example/false-positive/git/blobs/invalid-workflow"
+    ] = git_blob("jobs:\n  test:\n    runs-on:\n    steps: []\n")
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    checks = {check.key: check for check in result.checks}
+
+    assert checks["ci"].status == "fail"
+    assert checks["tests"].status == "fail"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/api.rs",
+        "test/parser.c",
+        "spec/auth.rb",
+        "__tests__/widget.tsx",
+        "src/test/java/org/example/Parser.java",
+        "pkg/parser_test.go",
+        "src/widget.test.ts",
+        "src/ParserTest.java",
+    ],
+)
+def test_cross_ecosystem_test_files_are_recognized(path):
+    repo = repository("ecosystem")
+    responses = complete_responses("ecosystem")
+    tree = responses["repos/Example/ecosystem/git/trees/main"]["tree"]
+    tree[:] = [entry for entry in tree if not entry["path"].startswith("tests/")]
+    tree.append({"path": path, "type": "blob", "size": 20})
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "tests")
+
+    assert check.status == "pass"
+    assert check.evidence == path
+
+
+def test_deeply_nested_workflow_is_rejected_without_crashing():
+    repo = repository("nested")
+    responses = complete_responses("nested")
+    nested = "[" * 2_000 + "]" * 2_000
+    responses["repos/Example/nested/git/blobs/ci-workflow"] = git_blob(nested)
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "fail"
+
+
+def test_manual_only_workflow_does_not_count_as_continuous_integration():
+    repo = repository("manual")
+    responses = complete_responses("manual")
+    responses["repos/Example/manual/git/blobs/ci-workflow"] = git_blob(
+        "on: workflow_dispatch\n"
+        "jobs:\n  audit:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "fail"
+
+
+def test_excess_workflow_candidates_report_bounded_validation_remediation():
+    repo = repository("many-workflows")
+    responses = complete_responses("many-workflows")
+    tree = responses["repos/Example/many-workflows/git/trees/main"]["tree"]
+    tree[:] = [
+        entry for entry in tree if not entry["path"].startswith(".github/workflows/")
+    ]
+    for index in range(11):
+        sha = f"workflow-{index:02d}"
+        tree.append(
+            {
+                "path": f".github/workflows/{index:02d}.yml",
+                "type": "blob",
+                "size": 20,
+                "sha": sha,
+            }
+        )
+        responses[f"repos/Example/many-workflows/git/blobs/{sha}"] = git_blob(
+            "on: workflow_dispatch\njobs: {}\n"
+        )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "skip"
+    assert "obsolete or invalid workflows" in check.remediation
 
 
 def test_profile_readme_must_be_nonempty_root_markdown_file():

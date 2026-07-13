@@ -23,8 +23,10 @@ Repository evidence:
 
 - description and at least three accurate topics;
 - a non-empty README in a GitHub-supported location and a detected license;
-- a non-empty YAML workflow and test-directory content for detected code
-  repositories;
+- a parseable GitHub Actions workflow triggered by pushes, pull requests, or
+  merge queues, with at least one executable job;
+- recognizable automated test source in conventional directories or filenames
+  across common language ecosystems;
 - non-empty contribution and security policies, including applicable defaults
   from the account's public `.github` repository.
 
@@ -50,8 +52,9 @@ github-portfolio-audit octocat \
 Anonymous GitHub API access is enough for small public profiles. Set `GH_TOKEN`
 to avoid the anonymous rate limit when auditing many repositories. The token is
 never printed or written to a report. Read-only requests retry transient network
-errors, rate limits with `Retry-After`, and common server failures twice with
-bounded delays.
+errors and common server failures twice. Rate-limit retries honor GitHub's full
+`Retry-After` or reset window; waits over five minutes fail promptly instead of
+retrying early.
 
 ## Use as a GitHub Action
 
@@ -90,8 +93,8 @@ Each scored check has a fixed weight:
 | Specific bio | 25 | Three or more topics | 10 |
 | Portfolio/product URL | 15 | README | 20 |
 | Location | 5 | Detected license | 15 |
-| Professional social link | 15 | CI workflow | 20 |
-| Profile README | 30 | Test directory | 10 |
+| Professional social link | 15 | Continuous integration workflow | 20 |
+| Profile README | 30 | Recognizable automated tests | 10 |
 | | | Contribution guide | 5 |
 | | | Security policy | 5 |
 

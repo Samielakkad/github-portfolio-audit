@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import json
+import re
 
 from .models import AuditReport, CheckResult
 
@@ -87,7 +89,12 @@ def render_markdown(report: AuditReport) -> str:
         if check.status == "skip" and check.applicable
     )
     lines.extend(["", "## Actionable gaps", ""])
-    if not failed and not unknown:
+    if not report.repositories:
+        lines.append(
+            "- **Repositories:** No eligible repositories were audited. Audit at "
+            "least one active, original public repository."
+        )
+    if not failed and not unknown and report.repositories:
         lines.append("No scored gaps found.")
     else:
         for repository, check in failed:
@@ -98,9 +105,12 @@ def render_markdown(report: AuditReport) -> str:
             )
         for repository, check in unknown:
             scope = repository.name if repository is not None else "profile"
+            remediation = check.remediation or (
+                "Evidence was unavailable; retry with a complete repository tree."
+            )
             lines.append(
                 f"- **{_escape(scope)} / {_escape(check.label)}:** "
-                "Evidence was unavailable; retry with a complete repository tree."
+                f"{_escape(remediation)}"
             )
 
     lines.extend(
@@ -128,4 +138,6 @@ def _markdown_check(check: CheckResult) -> str:
 
 
 def _escape(value: object) -> str:
-    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"([\\`*_\[\]()!|#~])", r"\\\1", text)
+    return html.escape(text, quote=True)

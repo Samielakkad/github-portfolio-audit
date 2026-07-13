@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any
+
+import yaml
 
 from .client import GitHubAPIError, GitHubClient
 from .models import AuditReport, CheckResult, RepositoryResult
@@ -19,19 +24,50 @@ CONTRIBUTING_NAMES = [
 ]
 MAINTENANCE_FILES = {
     "readme": [
-        *README_NAMES,
         *(f".github/{name}" for name in README_NAMES),
+        *README_NAMES,
         *(f"docs/{name}" for name in README_NAMES),
     ],
     "contributing": [
-        *CONTRIBUTING_NAMES,
         *(f".github/{name}" for name in CONTRIBUTING_NAMES),
+        *CONTRIBUTING_NAMES,
         *(f"docs/{name}" for name in CONTRIBUTING_NAMES),
     ],
-    "security": ["SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md"],
+    "security": [".github/SECURITY.md", "SECURITY.md", "docs/SECURITY.md"],
 }
 TEST_PATHS = ["tests", "test", "spec", "__tests__"]
 WORKFLOW_PATH = ".github/workflows"
+MAX_WORKFLOW_BYTES = 1_000_000
+MAX_WORKFLOW_CANDIDATES = 10
+CI_TRIGGERS = {"merge_group", "pull_request", "pull_request_target", "push"}
+TEST_FILE_SUFFIXES = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".dart",
+    ".exs",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".lua",
+    ".mjs",
+    ".php",
+    ".ps1",
+    ".py",
+    ".r",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".sh",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
 PROFILE_WEIGHTS = {
     "profile_name": 10,
     "profile_bio": 25,
@@ -58,6 +94,7 @@ class TreeEntry:
     kind: str
     size: int | None
     mode: str | None
+    sha: str | None
 
     @property
     def is_nonempty_blob(self) -> bool:
@@ -255,7 +292,14 @@ def _audit_repository(
             else "not detected",
             remediation="Add a license file GitHub can detect.",
         ),
-        _ci_check(tree, REPOSITORY_WEIGHTS["ci"], applicable=code_repository),
+        _ci_check(
+            client,
+            owner,
+            name,
+            tree,
+            REPOSITORY_WEIGHTS["ci"],
+            applicable=code_repository,
+        ),
         _tests_check(
             tree,
             REPOSITORY_WEIGHTS["tests"],
@@ -297,29 +341,32 @@ def _file_check(
         "contributing": "Contribution guide",
         "security": "Security policy",
     }[kind]
-    entry = _first_nonempty_blob(tree, candidates)
-    if entry is not None:
-        return CheckResult(kind, label, "pass", weight, entry.path)
+    local = _first_existing_entry(tree, candidates)
+    if local is not None:
+        index, entry = local
+        if not tree.complete and index > 0:
+            return _unknown_check(kind, label, weight)
+        return _maintenance_file_result(kind, label, weight, entry)
 
-    local_candidate_exists = any(
-        candidate.casefold() in tree.entries for candidate in candidates
-    )
-    if fallback is not None and tree.complete and not local_candidate_exists:
-        entry = _first_nonempty_blob(fallback, candidates)
-        if entry is not None:
-            return CheckResult(
+    if not tree.complete:
+        return _unknown_check(kind, label, weight)
+
+    if fallback is not None:
+        default = _first_existing_entry(fallback, candidates)
+        if default is not None:
+            index, entry = default
+            if not fallback.complete and index > 0:
+                return _unknown_check(kind, label, weight)
+            return _maintenance_file_result(
                 kind,
                 label,
-                "pass",
                 weight,
-                f"account .github default: {entry.path}",
+                entry,
+                prefix="account .github default: ",
             )
+        if not fallback.complete:
+            return _unknown_check(kind, label, weight)
 
-    fallback_needed = fallback is not None and not local_candidate_exists
-    fallback_complete = fallback is not None and fallback.complete
-    evidence_complete = tree.complete and (not fallback_needed or fallback_complete)
-    if not evidence_complete:
-        return _unknown_check(kind, label, weight)
     return CheckResult(
         kind,
         label,
@@ -330,12 +377,40 @@ def _file_check(
     )
 
 
-def _ci_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> CheckResult:
+def _maintenance_file_result(
+    kind: str,
+    label: str,
+    weight: int,
+    entry: TreeEntry,
+    *,
+    prefix: str = "",
+) -> CheckResult:
+    if entry.is_nonempty_blob:
+        return CheckResult(kind, label, "pass", weight, f"{prefix}{entry.path}")
+    return CheckResult(
+        kind,
+        label,
+        "fail",
+        weight,
+        f"{prefix}{entry.path} is empty or not a regular file",
+        f"Replace {entry.path} with a non-empty regular file.",
+    )
+
+
+def _ci_check(
+    client: GitHubClient,
+    owner: str,
+    name: str,
+    tree: RepositoryTree,
+    weight: int,
+    *,
+    applicable: bool,
+) -> CheckResult:
     label = "Continuous integration workflow"
     if not applicable:
         return _not_applicable_check("ci", label, weight)
     prefix = f"{WORKFLOW_PATH.casefold()}/"
-    workflow = next(
+    candidates = sorted(
         (
             entry
             for path, entry in tree.entries.items()
@@ -343,33 +418,46 @@ def _ci_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> CheckRe
             and "/" not in path[len(prefix) :]
             and path.endswith((".yml", ".yaml"))
             and entry.is_nonempty_blob
+            and entry.size is not None
+            and entry.size <= MAX_WORKFLOW_BYTES
+            and entry.sha is not None
         ),
-        None,
+        key=lambda entry: entry.path.casefold(),
     )
-    if workflow is not None:
-        return CheckResult("ci", label, "pass", weight, workflow.path)
+    for workflow in candidates[:MAX_WORKFLOW_CANDIDATES]:
+        if _is_valid_workflow(client, owner, name, workflow):
+            return CheckResult("ci", label, "pass", weight, workflow.path)
     if not tree.complete:
         return _unknown_check("ci", label, weight)
+    if len(candidates) > MAX_WORKFLOW_CANDIDATES:
+        return CheckResult(
+            "ci",
+            label,
+            "skip",
+            weight,
+            f"more than {MAX_WORKFLOW_CANDIDATES} workflow candidates",
+            "Remove obsolete or invalid workflows so validation can finish safely.",
+        )
     return CheckResult(
         "ci",
         label,
         "fail",
         weight,
-        "no non-empty YAML workflow found",
-        "Add a .yml or .yaml workflow in .github/workflows.",
+        "no valid continuous-integration workflow found",
+        "Add a push, pull-request, or merge-queue workflow with an executable job.",
     )
 
 
 def _tests_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> CheckResult:
-    label = "Automated test directory"
+    label = "Recognizable automated tests"
     if not applicable:
         return _not_applicable_check("tests", label, weight)
     test_file = next(
         (
             entry
-            for path, entry in tree.entries.items()
-            if any(path.startswith(f"{root.casefold()}/") for root in TEST_PATHS)
-            and entry.is_nonempty_blob
+            for entry in tree.entries.values()
+            if entry.is_nonempty_blob
+            and _is_plausible_test_file(entry.path)
         ),
         None,
     )
@@ -382,8 +470,81 @@ def _tests_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> Chec
         label,
         "fail",
         weight,
-        "no non-empty test file found",
-        f"Add test files below one of: {', '.join(TEST_PATHS)}.",
+        "no recognizable non-empty test file found",
+        f"Add conventionally named test files below one of: {', '.join(TEST_PATHS)}.",
+    )
+
+
+def _is_valid_workflow(
+    client: GitHubClient,
+    owner: str,
+    name: str,
+    entry: TreeEntry,
+) -> bool:
+    blob = client.get_json(
+        f"repos/{owner}/{name}/git/blobs/{entry.sha}", allow_not_found=True
+    )
+    if not isinstance(blob, dict) or blob.get("encoding") != "base64":
+        return False
+    content = blob.get("content")
+    if not isinstance(content, str):
+        return False
+    try:
+        decoded = base64.b64decode("".join(content.split()), validate=True)
+        workflow = yaml.load(decoded.decode("utf-8"), Loader=yaml.BaseLoader)
+    except (binascii.Error, RecursionError, UnicodeDecodeError, yaml.YAMLError):
+        return False
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
+        return False
+    return _has_ci_trigger(workflow.get("on")) and any(
+        _is_executable_job(job) for job in workflow["jobs"].values()
+    )
+
+
+def _has_ci_trigger(value: object) -> bool:
+    if isinstance(value, str):
+        return value in CI_TRIGGERS
+    if isinstance(value, list):
+        return any(isinstance(item, str) and item in CI_TRIGGERS for item in value)
+    if isinstance(value, dict):
+        return any(isinstance(key, str) and key in CI_TRIGGERS for key in value)
+    return False
+
+
+def _is_executable_job(job: object) -> bool:
+    if not isinstance(job, dict):
+        return False
+    reusable_workflow = job.get("uses")
+    if isinstance(reusable_workflow, str) and reusable_workflow.strip():
+        return True
+    runner = job.get("runs-on")
+    if isinstance(runner, str):
+        return bool(runner.strip())
+    return isinstance(runner, list) and bool(runner) and all(
+        isinstance(label, str) and bool(label.strip()) for label in runner
+    )
+
+
+def _is_plausible_test_file(path: str) -> bool:
+    file = PurePosixPath(path)
+    suffix = file.suffix.casefold()
+    if suffix not in TEST_FILE_SUFFIXES:
+        return False
+    if any(part.casefold() in TEST_PATHS for part in file.parts[:-1]):
+        return True
+
+    name = file.name.casefold()
+    stem = file.stem
+    folded_stem = stem.casefold()
+    if (
+        name.startswith(("test_", "test-", "test."))
+        or folded_stem.endswith(("_test", "-test", "_spec", "-spec"))
+        or ".test." in name
+        or ".spec." in name
+    ):
+        return True
+    return suffix in {".cs", ".java", ".kt", ".kts"} and stem.endswith(
+        ("Test", "Tests", "TestCase", "Spec")
     )
 
 
@@ -408,13 +569,13 @@ def _unknown_check(key: str, label: str, weight: int) -> CheckResult:
     )
 
 
-def _first_nonempty_blob(
+def _first_existing_entry(
     tree: RepositoryTree, candidates: list[str]
-) -> TreeEntry | None:
-    for candidate in candidates:
+) -> tuple[int, TreeEntry] | None:
+    for index, candidate in enumerate(candidates):
         entry = tree.entries.get(candidate.casefold())
-        if entry is not None and entry.is_nonempty_blob:
-            return entry
+        if entry is not None:
+            return index, entry
     return None
 
 
@@ -468,6 +629,7 @@ def _repository_tree(
         path = item["path"]
         kind = item.get("type") if isinstance(item.get("type"), str) else ""
         mode = item.get("mode") if isinstance(item.get("mode"), str) else None
+        sha = item.get("sha") if isinstance(item.get("sha"), str) else None
         raw_size = item.get("size")
         size = (
             raw_size
@@ -476,7 +638,7 @@ def _repository_tree(
             and raw_size >= 0
             else None
         )
-        entries[path.casefold()] = TreeEntry(path, kind, size, mode)
+        entries[path.casefold()] = TreeEntry(path, kind, size, mode, sha)
     return RepositoryTree(entries, not bool(tree.get("truncated")))
 
 

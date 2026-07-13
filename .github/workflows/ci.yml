@@ -38,3 +38,35 @@ jobs:
       - run: python -m pip install build
       - run: python -m build
 
+  action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start deterministic GitHub API fixture
+        shell: bash
+        run: |
+          python tests/fixtures/github_api_stub.py 8765 \
+            >"$RUNNER_TEMP/github-api-stub.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/github-api-stub.pid"
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8765/health >/dev/null; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          cat "$RUNNER_TEMP/github-api-stub.log"
+          exit 1
+      - name: Exercise the published composite action surface
+        uses: ./
+        env:
+          PORTFOLIO_AUDIT_API_URL: http://127.0.0.1:8765
+        with:
+          owner: Example
+          repository: quality-tool
+          min-score: "100"
+      - name: Stop deterministic GitHub API fixture
+        if: always()
+        shell: bash
+        run: kill "$(cat "$RUNNER_TEMP/github-api-stub.pid")" 2>/dev/null || true
+

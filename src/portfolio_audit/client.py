@@ -14,7 +14,9 @@ from typing import Any
 
 Transport = Callable[[str, Mapping[str, str]], tuple[int, Mapping[str, str], bytes]]
 Sleeper = Callable[[float], None]
-RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
+TRANSIENT_STATUSES = {408, 500, 502, 503, 504}
+RATE_LIMIT_STATUSES = {403, 429}
+MAX_RETRY_DELAY_SECONDS = 300.0
 
 
 class GitHubAPIError(RuntimeError):
@@ -88,13 +90,14 @@ class GitHubClient:
             except (OSError, http.client.HTTPException):
                 if attempt >= self._max_retries:
                     raise
-                self._sleep(_retry_delay({}, attempt))
+                self._sleep(_transient_delay(attempt))
                 continue
-            if not _should_retry(status, response_headers):
-                break
             if attempt >= self._max_retries:
                 break
-            self._sleep(_retry_delay(response_headers, attempt))
+            delay = _retry_delay(status, response_headers, payload, attempt)
+            if delay is None:
+                break
+            self._sleep(delay)
 
         if status == 404 and allow_not_found:
             return None
@@ -151,21 +154,55 @@ def _decode_error(payload: bytes) -> str:
     return "request failed"
 
 
-def _should_retry(status: int, headers: Mapping[str, str]) -> bool:
-    if status in RETRYABLE_STATUSES:
-        return True
-    return status == 403 and _header(headers, "Retry-After") is not None
+def _retry_delay(
+    status: int,
+    headers: Mapping[str, str],
+    payload: bytes,
+    attempt: int,
+) -> float | None:
+    if status not in TRANSIENT_STATUSES | RATE_LIMIT_STATUSES:
+        return None
 
-
-def _retry_delay(headers: Mapping[str, str], attempt: int) -> float:
     retry_after = _header(headers, "Retry-After")
     if retry_after is not None:
-        try:
-            delay = float(retry_after)
-            if math.isfinite(delay):
-                return min(max(delay, 0.0), 30.0)
-        except ValueError:
-            pass
+        return _safe_retry_delay(retry_after)
+
+    if status in RATE_LIMIT_STATUSES:
+        remaining = _header(headers, "X-RateLimit-Remaining")
+        if remaining == "0":
+            reset = _header(headers, "X-RateLimit-Reset")
+            if reset is None:
+                return None
+            try:
+                delay = max(float(reset) - time.time() + 1.0, 0.0)
+            except ValueError:
+                return None
+            return _bounded_delay(delay)
+
+        message = _decode_error(payload).casefold()
+        is_secondary = status == 429 or "secondary rate limit" in message
+        if not is_secondary:
+            return None
+        return _bounded_delay(60.0 * (2**attempt))
+
+    return _transient_delay(attempt)
+
+
+def _safe_retry_delay(value: str) -> float | None:
+    try:
+        delay = float(value)
+    except ValueError:
+        return None
+    return _bounded_delay(delay)
+
+
+def _bounded_delay(delay: float) -> float | None:
+    if not math.isfinite(delay) or delay < 0 or delay > MAX_RETRY_DELAY_SECONDS:
+        return None
+    return delay
+
+
+def _transient_delay(attempt: int) -> float:
     return min(0.5 * (2**attempt), 4.0)
 
 

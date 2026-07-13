@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import os
 import sys
 from pathlib import Path
@@ -60,22 +61,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    api_url = (
+        os.environ.get("PORTFOLIO_AUDIT_API_URL")
+        or os.environ.get("GITHUB_API_URL")
+        or "https://api.github.com"
+    )
     try:
         report = audit_portfolio(
-            GitHubClient(token),
+            GitHubClient(token, api_url=api_url),
             args.owner,
             repository_names=args.repositories,
             max_repositories=args.max_repositories,
         )
-    except (GitHubAPIError, OSError, ValueError) as error:
+    except (
+        GitHubAPIError,
+        OSError,
+        http.client.HTTPException,
+        ValueError,
+    ) as error:
         parser.exit(2, f"error: {error}\n")
 
     rendered = RENDERERS[args.format](report)
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered, encoding="utf-8")
-    else:
-        _write_stdout(rendered)
+    try:
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+        else:
+            _write_stdout(rendered)
+    except OSError as error:
+        parser.exit(2, f"error: could not write report: {error}\n")
 
     if args.min_score is not None and report.score < args.min_score:
         return 1
@@ -93,12 +107,12 @@ def _score(value: str) -> int:
 
 
 def _write_stdout(value: str) -> None:
-    try:
-        sys.stdout.write(value)
-    except UnicodeEncodeError:
-        sys.stdout.buffer.write(value.encode("utf-8"))
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(value.encode("utf-8"))
+        return
+    sys.stdout.write(value)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
