@@ -64,7 +64,6 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: Samielakkad/github-portfolio-audit@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -72,7 +71,8 @@ jobs:
 ```
 
 The Action writes a Markdown report to the workflow job summary and fails when
-the score is below `min-score`. It performs read-only API calls.
+the score is below `min-score`. It performs read-only API calls, so consumers do
+not need to check out their repository first.
 
 ## Score model
 
