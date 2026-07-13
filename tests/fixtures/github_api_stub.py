@@ -71,7 +71,8 @@ RESPONSES = {
     },
     "/repos/Example/quality-tool/git/blobs/ci-workflow": _blob(
         "on: [push, pull_request]\n"
-        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: python -m pytest\n"
     ),
 }
 

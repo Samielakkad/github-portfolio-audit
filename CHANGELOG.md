@@ -6,6 +6,10 @@ All notable changes are documented here. The project follows semantic versioning
 
 - Isolate Action reports in a private runner temporary directory and remove them
   on exit instead of trusting a caller-workspace path.
+- Neutralize untrusted Markdown in job summaries, write CLI output as UTF-8, and
+  report output-path failures without a traceback.
+- Exercise the composite Action end to end in required CI against a deterministic
+  local GitHub API fixture.
 - Validate Git tree object types and sizes, parse workflow content for continuous
   integration triggers and executable jobs, and recognize cross-ecosystem test
   source conventions before awarding repository evidence.

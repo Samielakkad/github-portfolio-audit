@@ -515,13 +515,39 @@ def _is_executable_job(job: object) -> bool:
     if not isinstance(job, dict):
         return False
     reusable_workflow = job.get("uses")
-    if isinstance(reusable_workflow, str) and reusable_workflow.strip():
-        return True
+    if isinstance(reusable_workflow, str):
+        return _is_reusable_workflow_reference(reusable_workflow.strip())
     runner = job.get("runs-on")
-    if isinstance(runner, str):
-        return bool(runner.strip())
-    return isinstance(runner, list) and bool(runner) and all(
-        isinstance(label, str) and bool(label.strip()) for label in runner
+    valid_runner = (isinstance(runner, str) and bool(runner.strip())) or (
+        isinstance(runner, list)
+        and bool(runner)
+        and all(isinstance(label, str) and bool(label.strip()) for label in runner)
+    )
+    if not valid_runner or not isinstance(job.get("steps"), list):
+        return False
+    return any(_is_executable_step(step) for step in job["steps"])
+
+
+def _is_reusable_workflow_reference(value: str) -> bool:
+    if not value or any(character.isspace() for character in value):
+        return False
+    if value.startswith("./.github/workflows/"):
+        return "@" not in value and value.endswith((".yml", ".yaml"))
+    path, separator, reference = value.rpartition("@")
+    return (
+        bool(separator)
+        and bool(reference)
+        and "/.github/workflows/" in path
+        and path.endswith((".yml", ".yaml"))
+    )
+
+
+def _is_executable_step(step: object) -> bool:
+    if not isinstance(step, dict):
+        return False
+    return any(
+        isinstance(step.get(key), str) and bool(step[key].strip())
+        for key in ("run", "uses")
     )
 
 

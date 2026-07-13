@@ -97,7 +97,8 @@ def complete_responses(repo_name="quality-tool"):
         },
         f"repos/Example/{repo_name}/git/blobs/ci-workflow": git_blob(
             "on: [push, pull_request]\n"
-            "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+            "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - run: python -m pytest\n"
         ),
     }
 
@@ -460,6 +461,33 @@ def test_manual_only_workflow_does_not_count_as_continuous_integration():
     responses["repos/Example/manual/git/blobs/ci-workflow"] = git_blob(
         "on: workflow_dispatch\n"
         "jobs:\n  audit:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "fail"
+
+
+def test_runner_job_without_executable_steps_does_not_count():
+    repo = repository("empty-job")
+    responses = complete_responses("empty-job")
+    responses["repos/Example/empty-job/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps: []\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "fail"
+
+
+def test_invalid_job_level_uses_does_not_count():
+    repo = repository("invalid-reuse")
+    responses = complete_responses("invalid-reuse")
+    responses["repos/Example/invalid-reuse/git/blobs/ci-workflow"] = git_blob(
+        "on: pull_request\njobs:\n  reuse:\n    uses: not-a-workflow\n"
     )
 
     result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
