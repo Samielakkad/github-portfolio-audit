@@ -512,6 +512,21 @@ def test_runner_group_and_labels_mapping_counts():
     assert check.status == "pass"
 
 
+def test_runner_labels_only_mapping_counts():
+    repo = repository("runner-labels")
+    responses = complete_responses("runner-labels")
+    responses["repos/Example/runner-labels/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  test:\n    runs-on:\n      labels: [self-hosted, linux]\n"
+        "    steps:\n      - run: make test\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "pass"
+
+
 def test_excess_workflow_candidates_report_bounded_validation_remediation():
     repo = repository("many-workflows")
     responses = complete_responses("many-workflows")

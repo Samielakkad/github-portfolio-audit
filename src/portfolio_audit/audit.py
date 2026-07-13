@@ -529,10 +529,12 @@ def _is_valid_runner(runner: object) -> bool:
     if not isinstance(runner, dict) or set(runner) - {"group", "labels"}:
         return False
     group = runner.get("group")
-    if not isinstance(group, str) or not group.strip():
-        return False
     labels = runner.get("labels")
-    return labels is None or _is_valid_runner_labels(labels)
+    if group is None and labels is None:
+        return False
+    valid_group = group is None or (isinstance(group, str) and bool(group.strip()))
+    valid_labels = labels is None or _is_valid_runner_labels(labels)
+    return valid_group and valid_labels
 
 
 def _is_valid_runner_labels(labels: object) -> bool:
