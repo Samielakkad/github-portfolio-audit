@@ -38,23 +38,4 @@ runs:
         INPUT_OWNER: ${{ inputs.owner }}
         INPUT_REPOSITORY: ${{ inputs.repository }}
         INPUT_MIN_SCORE: ${{ inputs['min-score'] }}
-      run: |
-        owner="${INPUT_OWNER:-$GITHUB_REPOSITORY_OWNER}"
-        repo_args=()
-        if [[ -n "$INPUT_REPOSITORY" ]]; then
-          repo_args=(--repo "$INPUT_REPOSITORY")
-        fi
-        set +e
-        github-portfolio-audit "$owner" \
-          "${repo_args[@]}" \
-          --format markdown \
-          --output portfolio-audit.md \
-          --min-score "$INPUT_MIN_SCORE"
-        status=$?
-        set -e
-        if [[ -f portfolio-audit.md ]]; then
-          cat portfolio-audit.md >> "$GITHUB_STEP_SUMMARY"
-        else
-          echo "Portfolio audit failed before producing a report." >> "$GITHUB_STEP_SUMMARY"
-        fi
-        exit "$status"
+      run: '"$GITHUB_ACTION_PATH/scripts/run-action.sh"'

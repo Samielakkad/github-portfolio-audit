@@ -12,3 +12,7 @@ The CLI reads `GH_TOKEN` or `GITHUB_TOKEN` from the environment. It never writes
 the token to output and makes only read-only API requests. For public portfolio
 audits, use the default GitHub Actions token with `contents: read` permissions.
 
+The composite Action creates reports in a private directory under `RUNNER_TEMP`,
+removes any prior report target before running the CLI, and deletes the temporary
+file and directory on exit. It never reads or overwrites a report path supplied
+by the caller workspace.

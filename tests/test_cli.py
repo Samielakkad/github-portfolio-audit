@@ -57,6 +57,12 @@ def test_minimum_score_returns_one(mock_audit):
 
 
 @patch("portfolio_audit.cli.audit_portfolio")
+def test_profile_only_report_cannot_pass_positive_threshold(mock_audit):
+    mock_audit.return_value = report(score_pass=True)
+    assert main(["example", "--min-score", "1"]) == 1
+
+
+@patch("portfolio_audit.cli.audit_portfolio")
 def test_api_error_exits_two_with_message(mock_audit, capsys):
     mock_audit.side_effect = GitHubAPIError(403, "rate limited", "https://api.test")
 
@@ -71,4 +77,3 @@ def test_rejects_score_outside_range():
     with pytest.raises(SystemExit) as error:
         main(["example", "--min-score", "101"])
     assert error.value.code == 2
-

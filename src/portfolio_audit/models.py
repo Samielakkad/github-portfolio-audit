@@ -16,6 +16,7 @@ class CheckResult:
     weight: int
     evidence: str
     remediation: str = ""
+    applicable: bool = True
 
 
 @dataclass
@@ -31,9 +32,14 @@ class RepositoryResult:
     def score(self) -> int:
         return weighted_score(self.checks)
 
+    @property
+    def coverage(self) -> int:
+        return evidence_coverage(self.checks)
+
     def to_dict(self) -> dict:
         result = asdict(self)
         result["score"] = self.score
+        result["coverage"] = self.coverage
         return result
 
 
@@ -53,13 +59,30 @@ class AuditReport:
     def repository_score(self) -> int:
         if not self.repositories:
             return 0
-        return round(sum(repo.score for repo in self.repositories) / len(self.repositories))
+        return round(
+            sum(repo.score for repo in self.repositories) / len(self.repositories)
+        )
+
+    @property
+    def repository_coverage(self) -> int:
+        if not self.repositories:
+            return 0
+        return round(
+            sum(repo.coverage for repo in self.repositories) / len(self.repositories)
+        )
 
     @property
     def score(self) -> int:
         if not self.repositories:
-            return self.profile_score
+            return 0
         return round(self.profile_score * 0.3 + self.repository_score * 0.7)
+
+    @property
+    def coverage(self) -> int:
+        if not self.repositories:
+            return 0
+        profile_coverage = evidence_coverage(self.profile_checks)
+        return round(profile_coverage * 0.3 + self.repository_coverage * 0.7)
 
     def to_dict(self) -> dict:
         return {
@@ -67,18 +90,29 @@ class AuditReport:
             "generated_at": self.generated_at,
             "profile_url": self.profile_url,
             "score": self.score,
+            "coverage": self.coverage,
             "profile_score": self.profile_score,
             "repository_score": self.repository_score,
+            "repository_coverage": self.repository_coverage,
             "profile_checks": [asdict(check) for check in self.profile_checks],
             "repositories": [repo.to_dict() for repo in self.repositories],
         }
 
 
 def weighted_score(checks: list[CheckResult]) -> int:
-    scorable = [check for check in checks if check.status != "skip"]
+    scorable = [check for check in checks if check.applicable]
     denominator = sum(check.weight for check in scorable)
     if denominator == 0:
         return 0
     numerator = sum(check.weight for check in scorable if check.status == "pass")
     return round(numerator * 100 / denominator)
 
+
+def evidence_coverage(checks: list[CheckResult]) -> int:
+    """Return the weighted share of applicable checks backed by known evidence."""
+    applicable = [check for check in checks if check.applicable]
+    denominator = sum(check.weight for check in applicable)
+    if denominator == 0:
+        return 0
+    verified = sum(check.weight for check in applicable if check.status != "skip")
+    return round(verified * 100 / denominator)

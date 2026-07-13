@@ -1,16 +1,24 @@
+import pytest
+
 from portfolio_audit.audit import PROFILE_WEIGHTS, REPOSITORY_WEIGHTS, audit_portfolio
+from portfolio_audit.client import GitHubAPIError
 
 
 class FakeClient:
     def __init__(self, responses=None, repositories=None):
         self.responses = responses or {}
         self.repositories = repositories or []
+        self.get_json_calls = []
         self.get_all_calls = []
 
     def get_json(self, path, *, params=None, allow_not_found=False):
         del params
+        self.get_json_calls.append(path)
         if path in self.responses:
-            return self.responses[path]
+            response = self.responses[path]
+            if isinstance(response, BaseException):
+                raise response
+            return response
         if allow_not_found:
             return None
         raise AssertionError(f"unexpected API path: {path}")
@@ -54,17 +62,27 @@ def repository(name="quality-tool", **overrides):
 def complete_responses(repo_name="quality-tool"):
     return {
         "users/Example": user(),
-        "users/Example/social_accounts": [{"provider": "linkedin", "url": "https://social.test"}],
+        "users/Example/social_accounts": [
+            {"provider": "linkedin", "url": "https://social.test"}
+        ],
         "repos/Example/Example": {"name": "Example"},
-        "repos/Example/Example/contents/README.md": {"name": "README.md"},
+        "repos/Example/Example/contents/README.md": {
+            "name": "README.md",
+            "type": "file",
+            "size": 100,
+        },
         f"repos/Example/{repo_name}/git/trees/main": {
             "truncated": False,
             "tree": [
-                {"path": "README.md"},
-                {"path": ".github/workflows/ci.yml"},
-                {"path": "tests/test_tool.py"},
-                {"path": "CONTRIBUTING.md"},
-                {"path": "SECURITY.md"},
+                {"path": "README.md", "type": "blob", "size": 100},
+                {
+                    "path": ".github/workflows/ci.yml",
+                    "type": "blob",
+                    "size": 100,
+                },
+                {"path": "tests/test_tool.py", "type": "blob", "size": 100},
+                {"path": "CONTRIBUTING.md", "type": "blob", "size": 100},
+                {"path": "SECURITY.md", "type": "blob", "size": 100},
             ],
         },
     }
@@ -103,7 +121,7 @@ def test_missing_evidence_fails_without_counting_code_only_checks():
         "repos/Example/Example": None,
         "repos/Example/docs/git/trees/main": {
             "truncated": False,
-            "tree": [{"path": "README.md"}],
+            "tree": [{"path": "README.md", "type": "blob", "size": 100}],
         },
     }
     report = audit_portfolio(FakeClient(responses, [docs_repo]), "Example")
@@ -111,7 +129,10 @@ def test_missing_evidence_fails_without_counting_code_only_checks():
     result = report.repositories[0]
     assert result.score == 29
     assert next(check for check in result.checks if check.key == "ci").status == "skip"
-    assert next(check for check in result.checks if check.key == "tests").status == "skip"
+    assert not next(check for check in result.checks if check.key == "ci").applicable
+    assert (
+        next(check for check in result.checks if check.key == "tests").status == "skip"
+    )
     assert report.profile_score == 0
     assert report.score == 20
 
@@ -150,7 +171,7 @@ def test_truncated_tree_skips_unknown_paths_instead_of_false_failure():
     responses = complete_responses("large")
     responses["repos/Example/large/git/trees/main"] = {
         "truncated": True,
-        "tree": [{"path": "README.md"}],
+        "tree": [{"path": "README.md", "type": "blob", "size": 100}],
     }
     report = audit_portfolio(FakeClient(responses, [repo]), "Example")
 
@@ -158,6 +179,9 @@ def test_truncated_tree_skips_unknown_paths_instead_of_false_failure():
     assert checks["readme"].status == "pass"
     assert checks["ci"].status == "skip"
     assert checks["security"].status == "skip"
+    assert checks["ci"].applicable
+    assert report.repositories[0].score == 60
+    assert report.repositories[0].coverage == 60
 
 
 def test_default_branch_is_url_encoded_for_tree_lookup():
@@ -189,3 +213,194 @@ def test_rejects_invalid_owner_and_repository_limit():
             assert "between 1 and 100" in str(error)
         else:
             raise AssertionError("invalid repository limit was accepted")
+
+
+def test_zero_eligible_repositories_cannot_receive_profile_score():
+    report = audit_portfolio(FakeClient(complete_responses(), []), "Example")
+
+    assert report.profile_score == 100
+    assert report.repository_score == 0
+    assert report.score == 0
+    assert report.coverage == 0
+
+
+def test_explicit_ineligible_repository_is_an_error():
+    responses = complete_responses()
+    client = FakeClient(responses)
+
+    with pytest.raises(ValueError, match="not auditable"):
+        audit_portfolio(client, "Example", repository_names=["Example"])
+
+
+def test_named_repositories_are_deduplicated_case_insensitively():
+    responses = complete_responses("selected")
+    responses["repos/Example/selected"] = repository("selected")
+    client = FakeClient(responses)
+
+    report = audit_portfolio(
+        client,
+        "Example",
+        repository_names=[" selected ", "SELECTED", "selected"],
+    )
+
+    assert [result.name for result in report.repositories] == ["selected"]
+    assert client.get_json_calls.count("repos/Example/selected") == 1
+
+
+def test_tree_entry_types_sizes_and_workflow_extension_are_verified():
+    repo = repository("bogus")
+    responses = complete_responses("bogus")
+    responses["repos/Example/bogus/git/trees/main"] = {
+        "truncated": False,
+        "tree": [
+            {"path": "README.md", "type": "tree"},
+            {
+                "path": "docs/README.md",
+                "type": "blob",
+                "mode": "120000",
+                "size": 16,
+            },
+            {
+                "path": ".github/workflows/README.md",
+                "type": "blob",
+                "size": 100,
+            },
+            {"path": "tests", "type": "blob", "size": 100},
+            {"path": "CONTRIBUTING.md", "type": "tree"},
+            {"path": "SECURITY.md", "type": "blob", "size": 0},
+        ],
+    }
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    checks = {check.key: check for check in result.checks}
+
+    assert result.score == 40
+    assert result.coverage == 100
+    for key in ("readme", "ci", "tests", "contributing", "security"):
+        assert checks[key].status == "fail"
+
+
+def test_empty_repository_409_is_scored_without_aborting_audit():
+    repo = repository("empty")
+    responses = complete_responses("empty")
+    responses["repos/Example/empty/git/trees/main"] = GitHubAPIError(
+        409,
+        "Git Repository is empty.",
+        "https://api.github.test/repos/Example/empty/git/trees/main",
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+
+    assert result.score == 40
+    assert result.coverage == 100
+    assert (
+        next(check for check in result.checks if check.key == "readme").status == "fail"
+    )
+
+
+def test_supported_readme_locations_and_account_community_defaults_count():
+    repo = repository("locations")
+    responses = complete_responses("locations")
+    responses["repos/Example/locations/git/trees/main"] = {
+        "truncated": False,
+        "tree": [
+            {"path": "docs/README.rst", "type": "blob", "size": 100},
+            {
+                "path": ".github/workflows/ci.yaml",
+                "type": "blob",
+                "size": 100,
+            },
+            {"path": "tests/test_tool.py", "type": "blob", "size": 100},
+        ],
+    }
+    responses["repos/Example/.github"] = {
+        "name": ".github",
+        "private": False,
+        "visibility": "public",
+        "default_branch": "main",
+    }
+    responses["repos/Example/.github/git/trees/main"] = {
+        "truncated": False,
+        "tree": [
+            {
+                "path": "docs/CONTRIBUTING.md",
+                "type": "blob",
+                "size": 100,
+            },
+            {
+                "path": ".github/SECURITY.md",
+                "type": "blob",
+                "size": 100,
+            },
+        ],
+    }
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    checks = {check.key: check for check in result.checks}
+
+    assert result.score == 100
+    assert checks["readme"].evidence == "docs/README.rst"
+    assert checks["contributing"].evidence.startswith("account .github default")
+    assert checks["security"].evidence.startswith("account .github default")
+
+
+def test_profile_readme_must_be_nonempty_root_markdown_file():
+    responses = complete_responses()
+    responses["repos/Example/Example/contents/README.md"] = {
+        "name": "README.md",
+        "type": "file",
+        "size": 0,
+    }
+
+    report = audit_portfolio(FakeClient(responses, [repository()]), "Example")
+    check = next(
+        check for check in report.profile_checks if check.key == "profile_readme"
+    )
+
+    assert check.status == "fail"
+    assert report.profile_score == 70
+
+
+def test_private_profile_repository_does_not_count_as_public_evidence():
+    responses = complete_responses()
+    responses["repos/Example/Example"] = {
+        "name": "Example",
+        "private": True,
+        "visibility": "private",
+    }
+    client = FakeClient(responses, [repository()])
+
+    report = audit_portfolio(client, "Example")
+    check = next(
+        check for check in report.profile_checks if check.key == "profile_readme"
+    )
+
+    assert check.status == "fail"
+    assert "repos/Example/Example/contents/README.md" not in client.get_json_calls
+
+
+def test_empty_local_policy_does_not_fall_back_to_account_default():
+    repo = repository("local-empty")
+    responses = complete_responses("local-empty")
+    local_tree = responses["repos/Example/local-empty/git/trees/main"]["tree"]
+    responses["repos/Example/local-empty/git/trees/main"]["tree"] = [
+        *(item for item in local_tree if item["path"] != "CONTRIBUTING.md"),
+        {"path": "docs/CONTRIBUTING.md", "type": "blob", "size": 0},
+    ]
+    responses["repos/Example/.github"] = {
+        "name": ".github",
+        "private": False,
+        "visibility": "public",
+        "default_branch": "main",
+    }
+    responses["repos/Example/.github/git/trees/main"] = {
+        "truncated": False,
+        "tree": [
+            {"path": "CONTRIBUTING.md", "type": "blob", "size": 100},
+        ],
+    }
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "contributing")
+
+    assert check.status == "fail"

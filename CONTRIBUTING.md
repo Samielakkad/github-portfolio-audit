@@ -8,6 +8,10 @@ portability. A new scored check needs:
 3. passing and failing fixture tests;
 4. no dependence on followers, stars, streaks, or raw activity volume.
 
+Checks must distinguish evidence that is genuinely not applicable from evidence
+that could not be verified. Unknown evidence remains part of the score denominator
+and must reduce the reported coverage percentage.
+
 ## Development
 
 ```bash
@@ -18,4 +22,3 @@ python -m build
 ```
 
 Open an issue before changing score weights or adding network permissions.
-

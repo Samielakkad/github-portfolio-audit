@@ -41,7 +41,7 @@ def test_rate_limit_error_has_actionable_message():
     client = GitHubClient(
         transport=lambda _url, _headers: (
             403,
-            {"X-RateLimit-Remaining": "0"},
+            {"x-ratelimit-remaining": "0"},
             b"{}",
         )
     )
@@ -64,7 +64,9 @@ def test_get_all_paginates_until_short_page():
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         page = int(query["page"][0])
         requested_pages.append(page)
-        items = [{"id": number} for number in range(100)] if page == 1 else [{"id": 100}]
+        items = (
+            [{"id": number} for number in range(100)] if page == 1 else [{"id": 100}]
+        )
         return 200, {}, json.dumps(items).encode()
 
     result = GitHubClient(transport=transport).get_all("users/octocat/repos")
@@ -81,3 +83,73 @@ def test_get_all_rejects_non_array_page():
     with pytest.raises(GitHubAPIError, match="not an array"):
         client.get_all("users/octocat/repos")
 
+
+def test_transient_status_retries_with_bounded_retry_after():
+    responses = [
+        (503, {"retry-after": "45"}, b"{}"),
+        (200, {}, json.dumps({"login": "octocat"}).encode()),
+    ]
+    sleeps = []
+    client = GitHubClient(
+        transport=lambda _url, _headers: responses.pop(0),
+        sleep=sleeps.append,
+    )
+
+    assert client.get_json("users/octocat") == {"login": "octocat"}
+    assert sleeps == [30.0]
+
+
+def test_invalid_retry_after_uses_backoff():
+    responses = [
+        (429, {"Retry-After": "NaN"}, b"{}"),
+        (200, {}, b"{}"),
+    ]
+    sleeps = []
+    client = GitHubClient(
+        transport=lambda _url, _headers: responses.pop(0),
+        sleep=sleeps.append,
+    )
+
+    assert client.get_json("users/octocat") == {}
+    assert sleeps == [0.5]
+
+
+def test_transport_error_retries_with_exponential_backoff():
+    calls = 0
+    sleeps = []
+
+    def transport(_url, _headers):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary network failure")
+        return 200, {}, b"{}"
+
+    client = GitHubClient(transport=transport, sleep=sleeps.append)
+
+    assert client.get_json("users/octocat") == {}
+    assert calls == 2
+    assert sleeps == [0.5]
+
+
+def test_retry_exhaustion_raises_last_api_error():
+    calls = 0
+    sleeps = []
+
+    def transport(_url, _headers):
+        nonlocal calls
+        calls += 1
+        return 503, {}, json.dumps({"message": "Unavailable"}).encode()
+
+    client = GitHubClient(transport=transport, sleep=sleeps.append)
+
+    with pytest.raises(GitHubAPIError, match="503: Unavailable"):
+        client.get_json("users/octocat")
+
+    assert calls == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_rejects_invalid_retry_limit():
+    with pytest.raises(ValueError, match="max_retries"):
+        GitHubClient(max_retries=11)

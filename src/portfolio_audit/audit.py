@@ -3,16 +3,32 @@
 from __future__ import annotations
 
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .client import GitHubClient
+from .client import GitHubAPIError, GitHubClient
 from .models import AuditReport, CheckResult, RepositoryResult
 
+README_NAMES = ["README.md", "README.rst", "README.txt", "README"]
+CONTRIBUTING_NAMES = [
+    "CONTRIBUTING.md",
+    "CONTRIBUTING.rst",
+    "CONTRIBUTING.txt",
+    "CONTRIBUTING",
+]
 MAINTENANCE_FILES = {
-    "readme": ["README.md", "README.rst", "README.txt", "README"],
-    "contributing": ["CONTRIBUTING.md", ".github/CONTRIBUTING.md"],
-    "security": ["SECURITY.md", ".github/SECURITY.md"],
+    "readme": [
+        *README_NAMES,
+        *(f".github/{name}" for name in README_NAMES),
+        *(f"docs/{name}" for name in README_NAMES),
+    ],
+    "contributing": [
+        *CONTRIBUTING_NAMES,
+        *(f".github/{name}" for name in CONTRIBUTING_NAMES),
+        *(f"docs/{name}" for name in CONTRIBUTING_NAMES),
+    ],
+    "security": ["SECURITY.md", ".github/SECURITY.md", "docs/SECURITY.md"],
 }
 TEST_PATHS = ["tests", "test", "spec", "__tests__"]
 WORKFLOW_PATH = ".github/workflows"
@@ -36,6 +52,29 @@ REPOSITORY_WEIGHTS = {
 }
 
 
+@dataclass(frozen=True)
+class TreeEntry:
+    path: str
+    kind: str
+    size: int | None
+    mode: str | None
+
+    @property
+    def is_nonempty_blob(self) -> bool:
+        return (
+            self.kind == "blob"
+            and self.mode != "120000"
+            and self.size is not None
+            and self.size > 0
+        )
+
+
+@dataclass(frozen=True)
+class RepositoryTree:
+    entries: dict[str, TreeEntry]
+    complete: bool
+
+
 def audit_portfolio(
     client: GitHubClient,
     owner: str,
@@ -49,6 +88,7 @@ def audit_portfolio(
         raise ValueError("owner must not be empty")
     if max_repositories < 1 or max_repositories > 100:
         raise ValueError("max_repositories must be between 1 and 100")
+    selected_names = _deduplicate_repository_names(repository_names or [])
 
     user = client.get_json(f"users/{owner}")
     if not isinstance(user, dict):
@@ -62,19 +102,23 @@ def audit_portfolio(
         f"repos/{canonical_owner}/{canonical_owner}", allow_not_found=True
     )
     has_profile_readme = False
-    if isinstance(profile_repo, dict):
-        has_profile_readme = _first_existing_path(
-            client,
-            canonical_owner,
-            canonical_owner,
-            MAINTENANCE_FILES["readme"],
-        ) is not None
+    if (
+        isinstance(profile_repo, dict)
+        and not profile_repo.get("private")
+        and profile_repo.get("visibility") in (None, "public")
+    ):
+        has_profile_readme = _has_profile_readme(client, canonical_owner)
     profile_checks = _profile_checks(user, social_accounts, has_profile_readme)
+    community_defaults = _community_default_tree(client, canonical_owner)
 
-    if repository_names:
+    explicit_selection = bool(selected_names)
+    if explicit_selection:
+        selected_names = selected_names[:max_repositories]
         raw_repositories = [
-            client.get_json(f"repos/{canonical_owner}/{name}")
-            for name in repository_names
+            client.get_json(
+                f"repos/{canonical_owner}/{urllib.parse.quote(name, safe='')}"
+            )
+            for name in selected_names
         ]
     else:
         raw_repositories = client.get_all(
@@ -86,15 +130,25 @@ def audit_portfolio(
     for raw_repo in raw_repositories:
         if not isinstance(raw_repo, dict):
             continue
-        if raw_repo.get("fork") or raw_repo.get("archived"):
+        ineligibility = _repository_ineligibility(raw_repo, canonical_owner)
+        if ineligibility is not None:
+            if explicit_selection:
+                name = raw_repo.get("name") or "requested repository"
+                raise ValueError(f"{name} is not auditable: {ineligibility}")
             continue
-        if raw_repo.get("private"):
-            continue
-        if raw_repo.get("name", "").casefold() == canonical_owner.casefold():
-            continue
-        repositories.append(_audit_repository(client, canonical_owner, raw_repo))
+        repositories.append(
+            _audit_repository(
+                client,
+                canonical_owner,
+                raw_repo,
+                community_defaults,
+            )
+        )
         if len(repositories) >= max_repositories:
             break
+
+    if explicit_selection and not repositories:
+        raise ValueError("none of the requested repositories could be audited")
 
     return AuditReport(
         owner=canonical_owner,
@@ -154,19 +208,27 @@ def _profile_checks(
             label="Profile README repository",
             status="pass" if has_profile_readme else "fail",
             weight=PROFILE_WEIGHTS["profile_readme"],
-            evidence="profile repository exists" if has_profile_readme else "not found",
-            remediation=f"Create a public {user.get('login')}/{user.get('login')} repository.",
+            evidence="non-empty root README.md" if has_profile_readme else "not found",
+            remediation=""
+            if has_profile_readme
+            else (
+                f"Add a non-empty root README.md to the public "
+                f"{user.get('login')}/{user.get('login')} repository."
+            ),
         ),
     ]
 
 
 def _audit_repository(
-    client: GitHubClient, owner: str, repo: dict[str, Any]
+    client: GitHubClient,
+    owner: str,
+    repo: dict[str, Any],
+    community_defaults: RepositoryTree,
 ) -> RepositoryResult:
     name = str(repo["name"])
     language = repo.get("language") if isinstance(repo.get("language"), str) else None
     code_repository = language is not None
-    paths, paths_complete = _repository_paths(client, owner, name, repo)
+    tree = _repository_tree(client, owner, name, repo)
     checks = [
         _present(
             "description",
@@ -182,7 +244,7 @@ def _audit_repository(
             evidence=f"{len(repo.get('topics') or [])} topic(s)",
             remediation="Add at least three accurate GitHub topics.",
         ),
-        _file_check(paths, paths_complete, "readme", REPOSITORY_WEIGHTS["readme"]),
+        _file_check(tree, "readme", REPOSITORY_WEIGHTS["readme"]),
         CheckResult(
             key="license",
             label="Detected license",
@@ -193,35 +255,23 @@ def _audit_repository(
             else "not detected",
             remediation="Add a license file GitHub can detect.",
         ),
-        _path_check(
-            paths,
-            paths_complete,
-            "ci",
-            "Continuous integration workflow",
-            [WORKFLOW_PATH],
-            REPOSITORY_WEIGHTS["ci"],
-            skip=not code_repository,
-        ),
-        _path_check(
-            paths,
-            paths_complete,
-            "tests",
-            "Automated test directory",
-            TEST_PATHS,
+        _ci_check(tree, REPOSITORY_WEIGHTS["ci"], applicable=code_repository),
+        _tests_check(
+            tree,
             REPOSITORY_WEIGHTS["tests"],
-            skip=not code_repository,
+            applicable=code_repository,
         ),
         _file_check(
-            paths,
-            paths_complete,
+            tree,
             "contributing",
             REPOSITORY_WEIGHTS["contributing"],
+            fallback=community_defaults,
         ),
         _file_check(
-            paths,
-            paths_complete,
+            tree,
             "security",
             REPOSITORY_WEIGHTS["security"],
+            fallback=community_defaults,
         ),
     ]
     return RepositoryResult(
@@ -235,102 +285,230 @@ def _audit_repository(
 
 
 def _file_check(
-    paths: set[str], paths_complete: bool, kind: str, weight: int
-) -> CheckResult:
-    candidates = MAINTENANCE_FILES[kind]
-    return _path_check(
-        paths,
-        paths_complete,
-        kind,
-        {
-            "readme": "Project README",
-            "contributing": "Contribution guide",
-            "security": "Security policy",
-        }[kind],
-        candidates,
-        weight,
-    )
-
-
-def _path_check(
-    repository_paths: set[str],
-    paths_complete: bool,
-    key: str,
-    label: str,
-    paths: list[str],
+    tree: RepositoryTree,
+    kind: str,
     weight: int,
     *,
-    skip: bool = False,
+    fallback: RepositoryTree | None = None,
 ) -> CheckResult:
-    if skip:
-        return CheckResult(key, label, "skip", weight, "not a detected code repository")
-    path = next(
-        (
-            path
-            for path in paths
-            if path.casefold() in repository_paths
-            or any(
-                repository_path.startswith(f"{path.casefold()}/")
-                for repository_path in repository_paths
-            )
-        ),
-        None,
+    candidates = MAINTENANCE_FILES[kind]
+    label = {
+        "readme": "Project README",
+        "contributing": "Contribution guide",
+        "security": "Security policy",
+    }[kind]
+    entry = _first_nonempty_blob(tree, candidates)
+    if entry is not None:
+        return CheckResult(kind, label, "pass", weight, entry.path)
+
+    local_candidate_exists = any(
+        candidate.casefold() in tree.entries for candidate in candidates
     )
-    if path is not None:
-        return CheckResult(key, label, "pass", weight, path)
-    if not paths_complete:
-        return CheckResult(
-            key,
-            label,
-            "skip",
-            weight,
-            "repository tree was unavailable or truncated",
-        )
+    if fallback is not None and tree.complete and not local_candidate_exists:
+        entry = _first_nonempty_blob(fallback, candidates)
+        if entry is not None:
+            return CheckResult(
+                kind,
+                label,
+                "pass",
+                weight,
+                f"account .github default: {entry.path}",
+            )
+
+    fallback_needed = fallback is not None and not local_candidate_exists
+    fallback_complete = fallback is not None and fallback.complete
+    evidence_complete = tree.complete and (not fallback_needed or fallback_complete)
+    if not evidence_complete:
+        return _unknown_check(kind, label, weight)
     return CheckResult(
-        key,
+        kind,
         label,
         "fail",
         weight,
-        "not found",
-        f"Add one of: {', '.join(paths)}.",
+        "no non-empty file found",
+        f"Add one of: {', '.join(candidates)}.",
     )
 
 
-def _first_existing_path(
-    client: GitHubClient, owner: str, repo: str, paths: list[str]
-) -> str | None:
-    for path in paths:
-        value = client.get_json(
-            f"repos/{owner}/{repo}/contents/{path}", allow_not_found=True
-        )
-        if value is not None:
-            return path
+def _ci_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> CheckResult:
+    label = "Continuous integration workflow"
+    if not applicable:
+        return _not_applicable_check("ci", label, weight)
+    prefix = f"{WORKFLOW_PATH.casefold()}/"
+    workflow = next(
+        (
+            entry
+            for path, entry in tree.entries.items()
+            if path.startswith(prefix)
+            and "/" not in path[len(prefix) :]
+            and path.endswith((".yml", ".yaml"))
+            and entry.is_nonempty_blob
+        ),
+        None,
+    )
+    if workflow is not None:
+        return CheckResult("ci", label, "pass", weight, workflow.path)
+    if not tree.complete:
+        return _unknown_check("ci", label, weight)
+    return CheckResult(
+        "ci",
+        label,
+        "fail",
+        weight,
+        "no non-empty YAML workflow found",
+        "Add a .yml or .yaml workflow in .github/workflows.",
+    )
+
+
+def _tests_check(tree: RepositoryTree, weight: int, *, applicable: bool) -> CheckResult:
+    label = "Automated test directory"
+    if not applicable:
+        return _not_applicable_check("tests", label, weight)
+    test_file = next(
+        (
+            entry
+            for path, entry in tree.entries.items()
+            if any(path.startswith(f"{root.casefold()}/") for root in TEST_PATHS)
+            and entry.is_nonempty_blob
+        ),
+        None,
+    )
+    if test_file is not None:
+        return CheckResult("tests", label, "pass", weight, test_file.path)
+    if not tree.complete:
+        return _unknown_check("tests", label, weight)
+    return CheckResult(
+        "tests",
+        label,
+        "fail",
+        weight,
+        "no non-empty test file found",
+        f"Add test files below one of: {', '.join(TEST_PATHS)}.",
+    )
+
+
+def _not_applicable_check(key: str, label: str, weight: int) -> CheckResult:
+    return CheckResult(
+        key,
+        label,
+        "skip",
+        weight,
+        "not a detected code repository",
+        applicable=False,
+    )
+
+
+def _unknown_check(key: str, label: str, weight: int) -> CheckResult:
+    return CheckResult(
+        key,
+        label,
+        "skip",
+        weight,
+        "repository tree was unavailable or truncated",
+    )
+
+
+def _first_nonempty_blob(
+    tree: RepositoryTree, candidates: list[str]
+) -> TreeEntry | None:
+    for candidate in candidates:
+        entry = tree.entries.get(candidate.casefold())
+        if entry is not None and entry.is_nonempty_blob:
+            return entry
     return None
 
 
-def _repository_paths(
+def _has_profile_readme(client: GitHubClient, owner: str) -> bool:
+    value = client.get_json(
+        f"repos/{owner}/{owner}/contents/README.md", allow_not_found=True
+    )
+    return (
+        isinstance(value, dict)
+        and value.get("type") == "file"
+        and _nonnegative_int(value.get("size")) > 0
+    )
+
+
+def _community_default_tree(client: GitHubClient, owner: str) -> RepositoryTree:
+    repo = client.get_json(f"repos/{owner}/.github", allow_not_found=True)
+    if not isinstance(repo, dict):
+        return RepositoryTree({}, True)
+    if repo.get("private") or repo.get("visibility") not in (None, "public"):
+        return RepositoryTree({}, True)
+    return _repository_tree(client, owner, ".github", repo)
+
+
+def _repository_tree(
     client: GitHubClient,
     owner: str,
     name: str,
     repo: dict[str, Any],
-) -> tuple[set[str], bool]:
+) -> RepositoryTree:
     default_branch = repo.get("default_branch")
     if not isinstance(default_branch, str) or not default_branch:
-        return set(), True
+        return RepositoryTree({}, True)
     encoded_branch = urllib.parse.quote(default_branch, safe="")
-    tree = client.get_json(
-        f"repos/{owner}/{name}/git/trees/{encoded_branch}",
-        params={"recursive": 1},
-        allow_not_found=True,
-    )
+    try:
+        tree = client.get_json(
+            f"repos/{owner}/{name}/git/trees/{encoded_branch}",
+            params={"recursive": 1},
+            allow_not_found=True,
+        )
+    except GitHubAPIError as error:
+        if error.status == 409 and "empty" in error.message.casefold():
+            return RepositoryTree({}, True)
+        raise
     if not isinstance(tree, dict) or not isinstance(tree.get("tree"), list):
-        return set(), False
-    paths = {
-        item["path"].casefold()
-        for item in tree["tree"]
-        if isinstance(item, dict) and isinstance(item.get("path"), str)
-    }
-    return paths, not bool(tree.get("truncated"))
+        return RepositoryTree({}, False)
+
+    entries: dict[str, TreeEntry] = {}
+    for item in tree["tree"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            continue
+        path = item["path"]
+        kind = item.get("type") if isinstance(item.get("type"), str) else ""
+        mode = item.get("mode") if isinstance(item.get("mode"), str) else None
+        raw_size = item.get("size")
+        size = (
+            raw_size
+            if isinstance(raw_size, int)
+            and not isinstance(raw_size, bool)
+            and raw_size >= 0
+            else None
+        )
+        entries[path.casefold()] = TreeEntry(path, kind, size, mode)
+    return RepositoryTree(entries, not bool(tree.get("truncated")))
+
+
+def _deduplicate_repository_names(names: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    for raw_name in names:
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("repository names must be non-empty strings")
+        name = raw_name.strip()
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+def _repository_ineligibility(repo: dict[str, Any], owner: str) -> str | None:
+    name = repo.get("name")
+    if not isinstance(name, str) or not name:
+        return "repository metadata did not include a name"
+    if name.casefold() == owner.casefold():
+        return "profile README repositories are audited as profile evidence"
+    if repo.get("fork"):
+        return "forks are excluded"
+    if repo.get("archived"):
+        return "archived repositories are excluded"
+    if repo.get("disabled"):
+        return "disabled repositories are excluded"
+    if repo.get("private") or repo.get("visibility") not in (None, "public"):
+        return "only public repositories are supported"
+    return None
 
 
 def _present(key: str, label: str, value: object, weight: int) -> CheckResult:
@@ -346,4 +524,8 @@ def _present(key: str, label: str, value: object, weight: int) -> CheckResult:
 
 
 def _nonnegative_int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else 0
+    )

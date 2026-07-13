@@ -15,14 +15,21 @@ def render_console(report: AuditReport) -> str:
     lines = [
         f"GitHub portfolio audit: {report.owner}",
         f"Overall {report.score}/100 | profile {report.profile_score}/100 | "
-        f"repositories {report.repository_score}/100",
+        f"repositories {report.repository_score}/100 | evidence coverage "
+        f"{report.coverage}%",
         "",
         "Profile",
     ]
     lines.extend(_console_check(check) for check in report.profile_checks)
     for repository in report.repositories:
         context = f"{repository.language or 'docs/data'}; {repository.stars} stars"
-        lines.extend(["", f"{repository.name}: {repository.score}/100 ({context})"])
+        lines.extend(
+            [
+                "",
+                f"{repository.name}: {repository.score}/100 "
+                f"({repository.coverage}% coverage; {context})",
+            ]
+        )
         lines.extend(_console_check(check) for check in repository.checks)
     return "\n".join(lines) + "\n"
 
@@ -31,10 +38,10 @@ def render_markdown(report: AuditReport) -> str:
     lines = [
         f"# GitHub portfolio audit: `{_escape(report.owner)}`",
         "",
-        "| Overall | Profile | Repository average | Repositories audited |",
-        "|---:|---:|---:|---:|",
+        "| Overall | Profile | Repository average | Evidence coverage | Repositories audited |",
+        "|---:|---:|---:|---:|---:|",
         f"| **{report.score}** | {report.profile_score} | "
-        f"{report.repository_score} | {len(report.repositories)} |",
+        f"{report.repository_score} | {report.coverage}% | {len(report.repositories)} |",
         "",
         "## Profile evidence",
         "",
@@ -47,14 +54,15 @@ def render_markdown(report: AuditReport) -> str:
             "",
             "## Repositories",
             "",
-            "| Repository | Score | Language | Stars | Forks |",
-            "|---|---:|---|---:|---:|",
+            "| Repository | Score | Coverage | Language | Stars | Forks |",
+            "|---|---:|---:|---|---:|---:|",
         ]
     )
     for repository in report.repositories:
         lines.append(
             f"| [{_escape(repository.name)}]({repository.url}) | "
-            f"{repository.score} | {_escape(repository.language or 'docs/data')} | "
+            f"{repository.score} | {repository.coverage}% | "
+            f"{_escape(repository.language or 'docs/data')} | "
             f"{repository.stars} | {repository.forks} |"
         )
 
@@ -64,9 +72,22 @@ def render_markdown(report: AuditReport) -> str:
         for check in repository.checks
         if check.status == "fail"
     ]
-    failed.extend((None, check) for check in report.profile_checks if check.status == "fail")
+    failed.extend(
+        (None, check) for check in report.profile_checks if check.status == "fail"
+    )
+    unknown = [
+        (repository, check)
+        for repository in report.repositories
+        for check in repository.checks
+        if check.status == "skip" and check.applicable
+    ]
+    unknown.extend(
+        (None, check)
+        for check in report.profile_checks
+        if check.status == "skip" and check.applicable
+    )
     lines.extend(["", "## Actionable gaps", ""])
-    if not failed:
+    if not failed and not unknown:
         lines.append("No scored gaps found.")
     else:
         for repository, check in failed:
@@ -74,6 +95,12 @@ def render_markdown(report: AuditReport) -> str:
             lines.append(
                 f"- **{_escape(scope)} / {_escape(check.label)}:** "
                 f"{_escape(check.remediation)}"
+            )
+        for repository, check in unknown:
+            scope = repository.name if repository is not None else "profile"
+            lines.append(
+                f"- **{_escape(scope)} / {_escape(check.label)}:** "
+                "Evidence was unavailable; retry with a complete repository tree."
             )
 
     lines.extend(
@@ -102,4 +129,3 @@ def _markdown_check(check: CheckResult) -> str:
 
 def _escape(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
-

@@ -22,9 +22,11 @@ Profile evidence:
 Repository evidence:
 
 - description and at least three accurate topics;
-- README and detected license;
-- CI and test directories for detected code repositories;
-- contribution and security policies.
+- a non-empty README in a GitHub-supported location and a detected license;
+- a non-empty YAML workflow and test-directory content for detected code
+  repositories;
+- non-empty contribution and security policies, including applicable defaults
+  from the account's public `.github` repository.
 
 Stars and forks appear as context only. They never change the score.
 
@@ -47,7 +49,9 @@ github-portfolio-audit octocat \
 
 Anonymous GitHub API access is enough for small public profiles. Set `GH_TOKEN`
 to avoid the anonymous rate limit when auditing many repositories. The token is
-never printed or written to a report.
+never printed or written to a report. Read-only requests retry transient network
+errors, rate limits with `Retry-After`, and common server failures twice with
+bounded delays.
 
 ## Use as a GitHub Action
 
@@ -72,7 +76,9 @@ jobs:
 
 The Action writes a Markdown report to the workflow job summary and fails when
 the score is below `min-score`. It performs read-only API calls, so consumers do
-not need to check out their repository first.
+not need to check out their repository first. Reports are created inside a
+private directory under `RUNNER_TEMP`, never in the caller workspace, and are
+removed when the step exits.
 
 ## Score model
 
@@ -89,11 +95,19 @@ Each scored check has a fixed weight:
 | | | Contribution guide | 5 |
 | | | Security policy | 5 |
 
-Skipped checks are removed from the denominator, so a documentation repository
-is not penalized for lacking a test suite. An unavailable or truncated Git tree
-also produces `SKIP`, never a false failure. The total combines profile evidence
-(30%) and the mean repository score (70%). JSON output includes every check,
-weight, status, evidence string, and remediation.
+Checks that do not apply are removed from the denominator, so a documentation
+repository is not penalized for lacking a test suite. Unknown evidence from an
+unavailable or truncated Git tree remains in the denominator but is shown as
+`SKIP`, avoiding both a false failure label and an inflated score. Reports expose
+weighted evidence coverage separately from score. The total combines profile
+evidence (30%) and the mean repository score (70%); when no eligible repository
+is audited, the overall score and coverage are zero. Explicitly selected forks,
+archives, private repositories, and profile README repositories produce an
+error instead of silently falling back to a profile-only score.
+
+JSON output includes every check's weight, status, applicability, evidence, and
+remediation, plus repository and overall coverage. Repeated `--repo` names are
+deduplicated case-insensitively before API requests.
 
 This is a hygiene audit, not a hiring verdict. It cannot assess code design,
 research validity, product usefulness, security quality, or whether stars came

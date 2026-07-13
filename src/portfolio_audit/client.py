@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -10,6 +12,8 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 Transport = Callable[[str, Mapping[str, str]], tuple[int, Mapping[str, str], bytes]]
+Sleeper = Callable[[float], None]
+RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 
 
 class GitHubAPIError(RuntimeError):
@@ -18,6 +22,7 @@ class GitHubAPIError(RuntimeError):
     def __init__(self, status: int, message: str, url: str):
         super().__init__(f"GitHub API returned {status}: {message} ({url})")
         self.status = status
+        self.message = message
         self.url = url
 
 
@@ -41,15 +46,21 @@ class GitHubClient:
         *,
         transport: Transport | None = None,
         api_url: str = "https://api.github.com",
+        sleep: Sleeper | None = None,
+        max_retries: int = 2,
     ):
+        if max_retries < 0 or max_retries > 10:
+            raise ValueError("max_retries must be between 0 and 10")
         self._token = token.strip() if token else None
         self._transport = transport or _http_transport
         self._api_url = api_url.rstrip("/")
+        self._sleep = sleep or time.sleep
+        self._max_retries = max_retries
 
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
-            "User-Agent": "github-portfolio-audit/0.1",
+            "User-Agent": "github-portfolio-audit/0.1.1",
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self._token:
@@ -68,12 +79,27 @@ class GitHubClient:
         if query:
             url = f"{url}?{query}"
 
-        status, response_headers, payload = self._transport(url, self._headers())
+        for attempt in range(self._max_retries + 1):
+            try:
+                status, response_headers, payload = self._transport(
+                    url, self._headers()
+                )
+            except OSError:
+                if attempt >= self._max_retries:
+                    raise
+                self._sleep(_retry_delay({}, attempt))
+                continue
+            if not _should_retry(status, response_headers):
+                break
+            if attempt >= self._max_retries:
+                break
+            self._sleep(_retry_delay(response_headers, attempt))
+
         if status == 404 and allow_not_found:
             return None
         if status < 200 or status >= 300:
             message = _decode_error(payload)
-            remaining = response_headers.get("X-RateLimit-Remaining")
+            remaining = _header(response_headers, "X-RateLimit-Remaining")
             if status == 403 and remaining == "0":
                 message = "API rate limit exhausted; provide GH_TOKEN and retry"
             raise GitHubAPIError(status, message, url)
@@ -82,7 +108,9 @@ class GitHubClient:
         try:
             return json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise GitHubAPIError(status, "response was not valid UTF-8 JSON", url) from error
+            raise GitHubAPIError(
+                status, "response was not valid UTF-8 JSON", url
+            ) from error
 
     def get_all(
         self,
@@ -103,7 +131,9 @@ class GitHubClient:
             if not isinstance(page_items, list):
                 raise GitHubAPIError(200, "paginated response was not an array", path)
             if not all(isinstance(item, dict) for item in page_items):
-                raise GitHubAPIError(200, "paginated array contained a non-object", path)
+                raise GitHubAPIError(
+                    200, "paginated array contained a non-object", path
+                )
             items.extend(page_items)
             if len(page_items) < per_page:
                 break
@@ -119,3 +149,28 @@ def _decode_error(payload: bytes) -> str:
         return value["message"]
     return "request failed"
 
+
+def _should_retry(status: int, headers: Mapping[str, str]) -> bool:
+    if status in RETRYABLE_STATUSES:
+        return True
+    return status == 403 and _header(headers, "Retry-After") is not None
+
+
+def _retry_delay(headers: Mapping[str, str], attempt: int) -> float:
+    retry_after = _header(headers, "Retry-After")
+    if retry_after is not None:
+        try:
+            delay = float(retry_after)
+            if math.isfinite(delay):
+                return min(max(delay, 0.0), 30.0)
+        except ValueError:
+            pass
+    return min(0.5 * (2**attempt), 4.0)
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    expected = name.casefold()
+    for key, value in headers.items():
+        if key.casefold() == expected:
+            return value
+    return None

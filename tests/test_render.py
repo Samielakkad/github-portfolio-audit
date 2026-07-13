@@ -22,7 +22,14 @@ def sample_report():
                 forks=2,
                 checks=[
                     CheckResult("readme", "README", "pass", 80, "README.md"),
-                    CheckResult("security", "Security", "fail", 20, "not found", "Add SECURITY.md."),
+                    CheckResult(
+                        "security",
+                        "Security",
+                        "fail",
+                        20,
+                        "not found",
+                        "Add SECURITY.md.",
+                    ),
                 ],
             )
         ],
@@ -49,3 +56,14 @@ def test_markdown_renderer_escapes_tables_and_rejects_vanity_scoring():
     assert "Stars, followers" in value
     assert "500" in value
 
+
+def test_markdown_renderer_surfaces_unknown_applicable_evidence():
+    report = sample_report()
+    report.repositories[0].checks = [
+        CheckResult("ci", "CI", "skip", 100, "tree unavailable")
+    ]
+
+    value = render_markdown(report)
+
+    assert "Evidence was unavailable" in value
+    assert "No scored gaps found" not in value
