@@ -518,14 +518,29 @@ def _is_executable_job(job: object) -> bool:
     if isinstance(reusable_workflow, str):
         return _is_reusable_workflow_reference(reusable_workflow.strip())
     runner = job.get("runs-on")
-    valid_runner = (isinstance(runner, str) and bool(runner.strip())) or (
-        isinstance(runner, list)
-        and bool(runner)
-        and all(isinstance(label, str) and bool(label.strip()) for label in runner)
-    )
-    if not valid_runner or not isinstance(job.get("steps"), list):
+    if not _is_valid_runner(runner) or not isinstance(job.get("steps"), list):
         return False
     return any(_is_executable_step(step) for step in job["steps"])
+
+
+def _is_valid_runner(runner: object) -> bool:
+    if isinstance(runner, (str, list)):
+        return _is_valid_runner_labels(runner)
+    if not isinstance(runner, dict) or set(runner) - {"group", "labels"}:
+        return False
+    group = runner.get("group")
+    if not isinstance(group, str) or not group.strip():
+        return False
+    labels = runner.get("labels")
+    return labels is None or _is_valid_runner_labels(labels)
+
+
+def _is_valid_runner_labels(labels: object) -> bool:
+    if isinstance(labels, str):
+        return bool(labels.strip())
+    return isinstance(labels, list) and bool(labels) and all(
+        isinstance(label, str) and bool(label.strip()) for label in labels
+    )
 
 
 def _is_reusable_workflow_reference(value: str) -> bool:

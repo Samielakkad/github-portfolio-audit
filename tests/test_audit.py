@@ -496,6 +496,22 @@ def test_invalid_job_level_uses_does_not_count():
     assert check.status == "fail"
 
 
+def test_runner_group_and_labels_mapping_counts():
+    repo = repository("runner-group")
+    responses = complete_responses("runner-group")
+    responses["repos/Example/runner-group/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  test:\n    runs-on:\n      group: build-runners\n"
+        "      labels: [self-hosted, linux]\n"
+        "    steps:\n      - uses: actions/checkout@v7\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "pass"
+
+
 def test_excess_workflow_candidates_report_bounded_validation_remediation():
     repo = repository("many-workflows")
     responses = complete_responses("many-workflows")
