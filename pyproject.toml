@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-portfolio-audit"
+version = "0.1.0"
+description = "Evidence-based GitHub profile and repository quality audits from the command line."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sami El Akkad" }]
+keywords = ["github", "portfolio", "audit", "repository", "developer-tools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8,<9",
+  "ruff>=0.11",
+]
+
+[project.scripts]
+github-portfolio-audit = "portfolio_audit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Samielakkad/github-portfolio-audit"
+Issues = "https://github.com/Samielakkad/github-portfolio-audit/issues"
+Changelog = "https://github.com/Samielakkad/github-portfolio-audit/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
