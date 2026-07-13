@@ -1,0 +1,23 @@
+name: Portfolio audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          owner: Samielakkad
+          repository: github-portfolio-audit
+          token: ${{ secrets.GITHUB_TOKEN }}
+          min-score: "90"
+
