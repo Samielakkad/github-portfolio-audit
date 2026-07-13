@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import time
@@ -84,7 +85,7 @@ class GitHubClient:
                 status, response_headers, payload = self._transport(
                     url, self._headers()
                 )
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 if attempt >= self._max_retries:
                     raise
                 self._sleep(_retry_delay({}, attempt))

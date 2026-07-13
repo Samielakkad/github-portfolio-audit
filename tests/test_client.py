@@ -1,3 +1,4 @@
+import http.client
 import json
 import urllib.parse
 
@@ -123,6 +124,24 @@ def test_transport_error_retries_with_exponential_backoff():
         calls += 1
         if calls == 1:
             raise OSError("temporary network failure")
+        return 200, {}, b"{}"
+
+    client = GitHubClient(transport=transport, sleep=sleeps.append)
+
+    assert client.get_json("users/octocat") == {}
+    assert calls == 2
+    assert sleeps == [0.5]
+
+
+def test_incomplete_response_retries():
+    calls = 0
+    sleeps = []
+
+    def transport(_url, _headers):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise http.client.IncompleteRead(b"partial", 5)
         return 200, {}, b"{}"
 
     client = GitHubClient(transport=transport, sleep=sleeps.append)
