@@ -425,7 +425,7 @@ def _ci_check(
         key=lambda entry: entry.path.casefold(),
     )
     for workflow in candidates[:MAX_WORKFLOW_CANDIDATES]:
-        if _is_valid_workflow(client, owner, name, workflow):
+        if _is_valid_workflow(client, owner, name, workflow, tree):
             return CheckResult("ci", label, "pass", weight, workflow.path)
     if not tree.complete:
         return _unknown_check("ci", label, weight)
@@ -480,6 +480,7 @@ def _is_valid_workflow(
     owner: str,
     name: str,
     entry: TreeEntry,
+    tree: RepositoryTree,
 ) -> bool:
     blob = client.get_json(
         f"repos/{owner}/{name}/git/blobs/{entry.sha}", allow_not_found=True
@@ -497,7 +498,7 @@ def _is_valid_workflow(
     if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
         return False
     return _has_ci_trigger(workflow.get("on")) and any(
-        _is_executable_job(job) for job in workflow["jobs"].values()
+        _is_executable_job(job, tree) for job in workflow["jobs"].values()
     )
 
 
@@ -511,12 +512,18 @@ def _has_ci_trigger(value: object) -> bool:
     return False
 
 
-def _is_executable_job(job: object) -> bool:
+def _is_executable_job(job: object, tree: RepositoryTree) -> bool:
     if not isinstance(job, dict):
         return False
     reusable_workflow = job.get("uses")
     if isinstance(reusable_workflow, str):
-        return _is_reusable_workflow_reference(reusable_workflow.strip())
+        reference = reusable_workflow.strip()
+        if not _is_reusable_workflow_reference(reference):
+            return False
+        if reference.startswith("./.github/workflows/"):
+            target = tree.entries.get(reference[2:].casefold())
+            return target is not None and target.is_nonempty_blob
+        return True
     runner = job.get("runs-on")
     if not _is_valid_runner(runner) or not isinstance(job.get("steps"), list):
         return False

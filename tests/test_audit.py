@@ -496,6 +496,59 @@ def test_invalid_job_level_uses_does_not_count():
     assert check.status == "fail"
 
 
+def test_missing_local_reusable_workflow_does_not_count():
+    repo = repository("missing-local-reuse")
+    responses = complete_responses("missing-local-reuse")
+    responses["repos/Example/missing-local-reuse/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  reuse:\n    uses: ./.github/workflows/missing.yml\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "fail"
+
+
+def test_existing_local_reusable_workflow_counts():
+    repo = repository("existing-local-reuse")
+    responses = complete_responses("existing-local-reuse")
+    responses["repos/Example/existing-local-reuse/git/trees/main"]["tree"].append(
+        {
+            "path": ".github/workflows/reusable.yml",
+            "type": "blob",
+            "size": 100,
+            "sha": "reusable-workflow",
+        }
+    )
+    responses["repos/Example/existing-local-reuse/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  reuse:\n    uses: ./.github/workflows/reusable.yml\n"
+    )
+
+    result = audit_portfolio(FakeClient(responses, [repo]), "Example").repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "pass"
+
+
+def test_missing_local_reusable_workflow_is_unknown_for_truncated_tree():
+    repo = repository("truncated-local-reuse")
+    responses = complete_responses("truncated-local-reuse")
+    responses["repos/Example/truncated-local-reuse/git/trees/main"]["truncated"] = True
+    responses["repos/Example/truncated-local-reuse/git/blobs/ci-workflow"] = git_blob(
+        "on: push\n"
+        "jobs:\n  reuse:\n    uses: ./.github/workflows/missing.yml\n"
+    )
+
+    result = audit_portfolio(
+        FakeClient(responses, [repo]), "Example"
+    ).repositories[0]
+    check = next(check for check in result.checks if check.key == "ci")
+
+    assert check.status == "skip"
+
+
 def test_runner_group_and_labels_mapping_counts():
     repo = repository("runner-group")
     responses = complete_responses("runner-group")
